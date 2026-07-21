@@ -164,7 +164,7 @@ async function initCamera() {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: settings.front ? "user" : "environment",
-        width: { ideal: 1280 }, height: { ideal: 720 },
+        width: { ideal: 640 }, height: { ideal: 480 },
       },
       audio: false,
     });
@@ -215,12 +215,29 @@ function detect() {
   game.lTarget = null; game.rTarget = null;
   if (fingertips.length === 1) {
     const f = fingertips[0];
-    if (f.x < 0.5) game.lTarget = toPaddle(f.y); else game.rTarget = toPaddle(f.y);
+    if (f.x < 0.5) game.lTarget = predict("l", toPaddle(f.y), t0);
+    else game.rTarget = predict("r", toPaddle(f.y), t0);
   } else if (fingertips.length >= 2) {
     const sorted = [...fingertips].sort((a, b) => a.x - b.x);
-    game.lTarget = toPaddle(sorted[0].y);
-    game.rTarget = toPaddle(sorted[sorted.length - 1].y);
+    game.lTarget = predict("l", toPaddle(sorted[0].y), t0);
+    game.rTarget = predict("r", toPaddle(sorted[sorted.length - 1].y), t0);
   }
+}
+
+// lead the target slightly along its velocity to cancel camera latency
+const pred = { l: { y: null, t: 0 }, r: { y: null, t: 0 } };
+function predict(side, raw, now) {
+  const p = pred[side];
+  let out = raw;
+  if (p.y != null) {
+    const dtp = (now - p.t) / 1000;
+    if (dtp > 0.005 && dtp < 0.15) {
+      const v = (raw - p.y) / dtp;
+      out = raw + Math.max(-0.15, Math.min(0.15, v * 0.06));
+    }
+  }
+  p.y = raw; p.t = now;
+  return Math.max(0, Math.min(1, out));
 }
 
 // -------- touch / mouse fallback --------
@@ -247,7 +264,7 @@ function loop(now) {
   detect();
 
   // paddles ease toward targets
-  const ease = 1 - Math.pow(0.0001, dt);   // fast but smooth
+  const ease = 1 - Math.exp(-26 * dt);     // snappy, light smoothing only
   if (game.lTarget != null) game.lY += (game.lTarget - game.lY) * ease;
   if (game.rTarget != null) game.rY += (game.rTarget - game.rY) * ease;
 
@@ -385,15 +402,27 @@ if (!document.documentElement.requestFullscreen) {
   });
 }
 
+// keep the screen awake while playing (same mechanism video players use)
+let wakeLock = null;
+async function acquireWakeLock() {
+  try {
+    wakeLock = await navigator.wakeLock?.request("screen");
+  } catch { /* unsupported or denied — screen may dim */ }
+}
+
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) running = false;
-  else if (overlay.style.display === "none") { running = true; lastT = performance.now(); }
+  else if (overlay.style.display === "none") {
+    running = true; lastT = performance.now();
+    acquireWakeLock();                // the OS releases it on tab switch; re-grab
+  }
 });
 
 document.getElementById("startBtn").onclick = async () => {
   overlay.style.display = "none";
   running = true;
   resetMatch();
+  acquireWakeLock();
   initCamera();                       // in parallel with model load
 };
 
