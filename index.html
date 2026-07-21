@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Finger Pong</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #0b0f14; color: #e8f0f8;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+  }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #cam { position: fixed; left: -9999px; top: 0; width: 2px; height: 2px; opacity: 0; }
+  #preview {
+    position: fixed; top: 10px; right: 10px; width: 26vw; max-width: 210px;
+    border-radius: 8px; border: 1px solid rgba(255,255,255,.25);
+    background: #000; z-index: 5; opacity: .85;
+  }
+  #hud {
+    position: fixed; top: 10px; left: 10px; z-index: 5;
+    font-size: 12px; opacity: .75; line-height: 1.5; pointer-events: none;
+    text-shadow: 0 1px 2px #000;
+  }
+  #controls {
+    position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 8px; z-index: 6;
+  }
+  #controls button {
+    background: rgba(20,30,42,.85); color: #e8f0f8;
+    border: 1px solid rgba(255,255,255,.25); border-radius: 8px;
+    padding: 8px 12px; font-size: 13px;
+  }
+  #controls button.on { border-color: #4dd2ff; color: #4dd2ff; }
+  #overlay {
+    position: fixed; inset: 0; z-index: 10;
+    background: rgba(6,10,16,.92);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; padding: 24px; box-sizing: border-box;
+  }
+  #overlay h1 { margin: 0 0 12px; font-size: 34px; letter-spacing: 3px; color: #4dd2ff; }
+  #overlay p { margin: 6px 0; max-width: 480px; font-size: 15px; opacity: .9; }
+  #overlay .small { font-size: 12.5px; opacity: .6; }
+  #startBtn {
+    margin-top: 22px; font-size: 20px; padding: 14px 44px;
+    background: #4dd2ff; color: #06222e; border: none; border-radius: 10px; font-weight: 700;
+  }
+  #err {
+    position: fixed; left: 50%; transform: translateX(-50%); bottom: 60px;
+    background: rgba(160,40,40,.92); padding: 8px 14px; border-radius: 8px;
+    font-size: 13px; z-index: 20; display: none; max-width: 88vw;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<video id="cam" playsinline muted autoplay></video>
+<canvas id="preview" width="240" height="180"></canvas>
+<div id="hud"></div>
+<div id="controls">
+  <button id="camBtn">📷 Camera</button>
+  <button id="mirrorBtn">🪞 Mirror</button>
+  <button id="invertBtn">↕ Invert</button>
+</div>
+<div id="err"></div>
+<div id="overlay">
+  <h1>FINGER PONG</h1>
+  <p>Prop the phone upright. Draw two vertical lines on a paper in front of it — one per player.</p>
+  <p>Each player slides an <b>index finger</b> along their line. Leftmost finger = left paddle.</p>
+  <p class="small">No camera / just testing? You can also drag directly on the screen — left half moves the left paddle, right half the right.</p>
+  <p class="small">First load downloads the hand-tracking model (~10&nbsp;MB), needs internet once.</p>
+  <button id="startBtn">START</button>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const video = document.getElementById("cam");
+const preview = document.getElementById("preview");
+const pctx = preview.getContext("2d");
+const hud = document.getElementById("hud");
+const errBox = document.getElementById("err");
+const overlay = document.getElementById("overlay");
+
+const settings = { front: true, mirror: true, invert: false };
+
+let landmarker = null;
+let modelState = "loading";       // loading | ready | failed
+let camState = "off";             // off | on | failed
+let running = false;
+
+// -------- game state (px units, recomputed on resize) --------
+let W = 0, H = 0, DPR = 1;
+const game = {
+  lY: 0.5, rY: 0.5,               // paddle centers, normalized 0..1
+  lTarget: null, rTarget: null,   // tracking targets (null = no hand)
+  ball: { x: 0, y: 0, vx: 0, vy: 0 },
+  scoreL: 0, scoreR: 0,
+  serveDir: 1, serveTimer: 0,
+  winner: null,
+  handsSeen: 0, lastHandTime: 0,
+  detectMs: 0, frameSkip: false, frameFlag: false,
+};
+const WIN_SCORE = 7;
+const PADDLE_H = 0.22, PADDLE_W = 0.018, PADDLE_INSET = 0.035;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.round(innerWidth * DPR);
+  H = Math.round(innerHeight * DPR);
+  canvas.width = W; canvas.height = H;
+}
+addEventListener("resize", resize);
+resize();
+
+function serve(dir) {
+  const speed = 0.45;             // canvas-widths per second
+  const ang = (Math.random() * 60 - 30) * Math.PI / 180;
+  game.ball.x = 0.5; game.ball.y = 0.5;
+  game.ball.vx = Math.cos(ang) * speed * dir;
+  game.ball.vy = Math.sin(ang) * speed;
+  game.serveTimer = 0.9;          // pause before ball moves
+}
+
+function resetMatch() {
+  game.scoreL = 0; game.scoreR = 0; game.winner = null;
+  serve(Math.random() < 0.5 ? 1 : -1);
+}
+
+// -------- hand tracking --------
+async function initModel() {
+  try {
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const opts = (delegate) => ({
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate,
+      },
+      runningMode: "VIDEO",
+      numHands: 2,
+    });
+    try { landmarker = await HandLandmarker.createFromOptions(vision, opts("GPU")); }
+    catch { landmarker = await HandLandmarker.createFromOptions(vision, opts("CPU")); }
+    modelState = "ready";
+  } catch (e) {
+    modelState = "failed";
+    showErr("Hand tracking failed to load (offline?). Touch control still works.");
+    console.error(e);
+  }
+}
+
+async function initCamera() {
+  if (video.srcObject) {
+    for (const t of video.srcObject.getTracks()) t.stop();
+    video.srcObject = null;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: settings.front ? "user" : "environment",
+        width: { ideal: 1280 }, height: { ideal: 720 },
+      },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    camState = "on";
+  } catch (e) {
+    camState = "failed";
+    showErr("Camera unavailable (needs HTTPS + permission). Touch control still works.");
+    console.error(e);
+  }
+}
+
+let fingertips = [];              // [{x, y}] normalized, mirror already applied
+
+function detect() {
+  if (!landmarker || camState !== "on" || video.readyState < 2) return;
+  // adaptive skip: if detection is slow, run every other frame
+  game.frameFlag = !game.frameFlag;
+  if (game.frameSkip && game.frameFlag) return;
+
+  const t0 = performance.now();
+  let res;
+  try { res = landmarker.detectForVideo(video, t0); }
+  catch { return; }
+  const dt = performance.now() - t0;
+  game.detectMs = game.detectMs * 0.9 + dt * 0.1;
+  game.frameSkip = game.detectMs > 25;
+
+  fingertips = [];
+  for (const lm of res.landmarks || []) {
+    const tip = lm[8];            // index fingertip
+    if (!tip) continue;
+    let x = tip.x, y = tip.y;
+    if (settings.mirror) x = 1 - x;
+    fingertips.push({ x, y });
+  }
+  game.handsSeen = fingertips.length;
+  if (fingertips.length) game.lastHandTime = performance.now();
+
+  // map fingers to paddles
+  const margin = 0.12;
+  const toPaddle = (y) => {
+    let t = (y - margin) / (1 - 2 * margin);
+    t = Math.max(0, Math.min(1, t));
+    return settings.invert ? 1 - t : t;
+  };
+  game.lTarget = null; game.rTarget = null;
+  if (fingertips.length === 1) {
+    const f = fingertips[0];
+    if (f.x < 0.5) game.lTarget = toPaddle(f.y); else game.rTarget = toPaddle(f.y);
+  } else if (fingertips.length >= 2) {
+    const sorted = [...fingertips].sort((a, b) => a.x - b.x);
+    game.lTarget = toPaddle(sorted[0].y);
+    game.rTarget = toPaddle(sorted[sorted.length - 1].y);
+  }
+}
+
+// -------- touch / mouse fallback --------
+function pointerMove(clientX, clientY) {
+  const t = Math.max(0, Math.min(1, clientY / innerHeight));
+  if (clientX < innerWidth / 2) game.lTarget = t; else game.rTarget = t;
+}
+canvas.addEventListener("touchstart", (e) => { for (const t of e.touches) pointerMove(t.clientX, t.clientY); }, { passive: true });
+canvas.addEventListener("touchmove",  (e) => { for (const t of e.touches) pointerMove(t.clientX, t.clientY); }, { passive: true });
+let mouseDown = false;
+canvas.addEventListener("mousedown", (e) => { mouseDown = true; pointerMove(e.clientX, e.clientY); });
+addEventListener("mouseup", () => { mouseDown = false; });
+canvas.addEventListener("mousemove", (e) => { if (mouseDown) pointerMove(e.clientX, e.clientY); });
+canvas.addEventListener("click", () => { if (game.winner) resetMatch(); });
+
+// -------- game loop --------
+let lastT = performance.now();
+function loop(now) {
+  requestAnimationFrame(loop);
+  const dt = Math.min((now - lastT) / 1000, 0.05);
+  lastT = now;
+  if (!running) return;
+
+  detect();
+
+  // paddles ease toward targets
+  const ease = 1 - Math.pow(0.0001, dt);   // fast but smooth
+  if (game.lTarget != null) game.lY += (game.lTarget - game.lY) * ease;
+  if (game.rTarget != null) game.rY += (game.rTarget - game.rY) * ease;
+
+  // ball
+  const b = game.ball;
+  if (!game.winner) {
+    if (game.serveTimer > 0) game.serveTimer -= dt;
+    else {
+      b.x += b.vx * dt; b.y += b.vy * dt * (W / H);
+      const rBall = 0.012;
+      if (b.y < rBall && b.vy < 0) b.vy = -b.vy;
+      if (b.y > 1 - rBall && b.vy > 0) b.vy = -b.vy;
+
+      const hitPaddle = (px, py) => Math.abs(b.y - py) < PADDLE_H / 2 + rBall;
+      const lx = PADDLE_INSET + PADDLE_W, rx = 1 - PADDLE_INSET - PADDLE_W;
+      if (b.vx < 0 && b.x < lx + rBall && b.x > PADDLE_INSET - 0.02 && hitPaddle(lx, game.lY)) {
+        b.vx = -b.vx * 1.05;
+        b.vy += ((b.y - game.lY) / (PADDLE_H / 2)) * 0.25;
+      }
+      if (b.vx > 0 && b.x > rx - rBall && b.x < 1 - PADDLE_INSET + 0.02 && hitPaddle(rx, game.rY)) {
+        b.vx = -b.vx * 1.05;
+        b.vy += ((b.y - game.rY) / (PADDLE_H / 2)) * 0.25;
+      }
+      b.vx = Math.max(-1.6, Math.min(1.6, b.vx));
+      b.vy = Math.max(-1.2, Math.min(1.2, b.vy));
+
+      if (b.x < -0.04) { game.scoreR++; game.scoreR >= WIN_SCORE ? game.winner = "RIGHT" : serve(1); }
+      if (b.x > 1.04)  { game.scoreL++; game.scoreL >= WIN_SCORE ? game.winner = "LEFT"  : serve(-1); }
+    }
+  }
+
+  draw();
+  drawPreview();
+  updateHud();
+}
+
+function draw() {
+  ctx.fillStyle = "#0b0f14";
+  ctx.fillRect(0, 0, W, H);
+
+  // center dashed line
+  ctx.strokeStyle = "rgba(255,255,255,.18)";
+  ctx.lineWidth = 3 * DPR;
+  ctx.setLineDash([12 * DPR, 14 * DPR]);
+  ctx.beginPath(); ctx.moveTo(W / 2, 0); ctx.lineTo(W / 2, H); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // scores
+  ctx.fillStyle = "rgba(255,255,255,.30)";
+  ctx.font = `${64 * DPR}px system-ui`;
+  ctx.textAlign = "center";
+  ctx.fillText(game.scoreL, W * 0.35, 80 * DPR);
+  ctx.fillText(game.scoreR, W * 0.65, 80 * DPR);
+
+  // paddles
+  const ph = PADDLE_H * H, pw = PADDLE_W * W;
+  ctx.fillStyle = "#4dd2ff";
+  ctx.fillRect(PADDLE_INSET * W, game.lY * H - ph / 2, pw, ph);
+  ctx.fillStyle = "#ffb84d";
+  ctx.fillRect(W - PADDLE_INSET * W - pw, game.rY * H - ph / 2, pw, ph);
+
+  // ball
+  if (!game.winner) {
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.arc(game.ball.x * W, game.ball.y * H, 0.012 * W, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    ctx.fillStyle = "#e8f0f8";
+    ctx.font = `bold ${40 * DPR}px system-ui`;
+    ctx.fillText(`${game.winner} WINS!`, W / 2, H / 2 - 20 * DPR);
+    ctx.font = `${20 * DPR}px system-ui`;
+    ctx.fillText("tap to play again", W / 2, H / 2 + 24 * DPR);
+  }
+}
+
+function drawPreview() {
+  if (camState !== "on" || video.readyState < 2) return;
+  const pw = preview.width, ph = preview.height;
+  pctx.save();
+  if (settings.mirror) { pctx.translate(pw, 0); pctx.scale(-1, 1); }
+  pctx.drawImage(video, 0, 0, pw, ph);
+  pctx.restore();
+  for (const f of fingertips) {
+    pctx.fillStyle = f.x < 0.5 ? "#4dd2ff" : "#ffb84d";
+    pctx.beginPath();
+    pctx.arc(f.x * pw, f.y * ph, 6, 0, Math.PI * 2);
+    pctx.fill();
+  }
+}
+
+function updateHud() {
+  const noHands = performance.now() - game.lastHandTime > 1500;
+  hud.innerHTML =
+    `model: ${modelState} · cam: ${camState} · hands: ${game.handsSeen}` +
+    (modelState === "ready" && camState === "on" && noHands
+      ? `<br><b style="color:#ffb84d">show your index fingers to the camera</b>` : "");
+}
+
+function showErr(msg) {
+  errBox.textContent = msg;
+  errBox.style.display = "block";
+  setTimeout(() => (errBox.style.display = "none"), 7000);
+}
+
+// -------- controls --------
+const camBtn = document.getElementById("camBtn");
+const mirrorBtn = document.getElementById("mirrorBtn");
+const invertBtn = document.getElementById("invertBtn");
+function refreshBtns() {
+  camBtn.textContent = settings.front ? "📷 Front" : "📷 Back";
+  mirrorBtn.classList.toggle("on", settings.mirror);
+  invertBtn.classList.toggle("on", settings.invert);
+}
+camBtn.onclick = async () => {
+  settings.front = !settings.front;
+  settings.mirror = settings.front;   // sensible default per camera
+  refreshBtns();
+  await initCamera();
+};
+mirrorBtn.onclick = () => { settings.mirror = !settings.mirror; refreshBtns(); };
+invertBtn.onclick = () => { settings.invert = !settings.invert; refreshBtns(); };
+refreshBtns();
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) running = false;
+  else if (overlay.style.display === "none") { running = true; lastT = performance.now(); }
+});
+
+document.getElementById("startBtn").onclick = async () => {
+  overlay.style.display = "none";
+  running = true;
+  resetMatch();
+  initCamera();                       // in parallel with model load
+};
+
+initModel();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
